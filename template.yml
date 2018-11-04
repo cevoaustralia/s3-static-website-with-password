@@ -30,36 +30,12 @@ Resources:
     Type: AWS::S3::Bucket
     Properties: {}
 
-  LogsBucket:
-    Condition: IsInUSEast1
-    DeletionPolicy: Retain
-    Type: AWS::S3::Bucket
-    Properties: {}
-
   AccessIdentity:
     Condition: IsInUSEast1
     Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
     Properties:
       CloudFrontOriginAccessIdentityConfig:
         Comment: Allowed to access S3
-
-  LogsBucketPolicy:
-    Condition: IsInUSEast1
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref LogsBucket
-      PolicyDocument: 
-        Statement:
-          - Sid: Grant CloudFront log write access to logs bucket
-            Effect: Allow
-            Action: '*'
-            Resource:
-              - !GetAtt LogsBucket.Arn
-              - !Sub ${LogsBucket.Arn}/*
-            Principal:
-              CanonicalUser: c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0
-              # This is the magic canonical ID of the awslogsdelivery account, from 
-              # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html
 
   ContentBucketPolicy:
     Condition: IsInUSEast1
@@ -393,7 +369,6 @@ Resources:
       Type: A
 
   Distribution:
-    DependsOn: LogsBucketPolicy
     Condition: IsInUSEast1
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -414,8 +389,6 @@ Resources:
           ViewerProtocolPolicy: redirect-to-https
         DefaultRootObject: index.html
         Enabled: true
-        Logging:
-            Bucket: !Ref LogsBucket
         Origins:
           - Id: s3-origin
             S3OriginConfig:
