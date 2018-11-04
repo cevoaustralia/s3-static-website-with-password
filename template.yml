@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  Username:
+    Type: String
+    Description: The username to permit access to
+  Password:
+    Type: String
+    Description: The password for the username
+    NoEcho: true
+  Domain:
+    Type: String
+    Description: The Route53 DNS domain that the site will appear in
+  SitePrefix:
+    Type: String
+    Description: The hostname part of the site, prepended to the Domain
+
+# This stack _must_ be created in us-east-1 because of the certificate association with
+# the cloudfront distribution
+#
+# Creating it in a different region means that no resources will be created, so it'll be
+# an empty stack (but at least it won't cost anything)
+Conditions:
+  IsInUSEast1: !Equals [!Ref "AWS::Region", "us-east-1"]
+
+Resources:
+  ContentBucket:
+    Condition: IsInUSEast1
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties: {}
+
+  LogsBucket:
+    Condition: IsInUSEast1
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties: {}
+
+  AccessIdentity:
+    Condition: IsInUSEast1
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Allowed to access S3
+
+  LogsBucketPolicy:
+    Condition: IsInUSEast1
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument: 
+        Statement:
+          - Sid: Grant CloudFront log write access to logs bucket
+            Effect: Allow
+            Action: '*'
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub ${LogsBucket.Arn}/*
+            Principal:
+              CanonicalUser: c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0
+              # This is the magic canonical ID of the awslogsdelivery account, from 
+              # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html
+
+  ContentBucketPolicy:
+    Condition: IsInUSEast1
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument: 
+        Statement:
+          - Sid: Grant CloudFront OAI access to private content
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ContentBucket}/*
+            Principal:
+              CanonicalUser: !GetAtt AccessIdentity.S3CanonicalUserId
+
+  ACMCertificate:
+    Condition: IsInUSEast1
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub ${SitePrefix}.${Domain}
+      ValidationMethod: DNS
+
+  # ------------------------------
+  # Create a simple "hello world" HTML
+  # file in the root of the content bucket
+  HelloWorld:
+    DependsOn: ContentBucket
+    Condition: IsInUSEast1
+    Type: Custom::HelloWorld
+    Properties:
+      ServiceToken: !GetAtt HelloWorldFunction.Arn
+      Bucket: !Ref ContentBucket
+
+  # ------------------------------
+  # The IAM role and Lambda function for the custom resource
+  # which creates the "hello world" object
+  HelloWorldFunctionRole:
+    Condition: IsInUSEast1
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: ObjectWriter
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Resource: '*'
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Sid: AllowCreateObjec
+                Effect: Allow
+                Resource:
+                  - !Sub ${ContentBucket.Arn}/*
+                Action:
+                  - s3:PutObject
+
+  HelloWorldFunction:
+    Condition: IsInUSEast1
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt HelloWorldFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+            bucket = event['ResourceProperties']['Bucket']
+
+            if not bucket:
+              response = {'Message': 'Cannot put object in non-existent bucket'}
+              cfnresponse.send(event, context, cfnresponse.FAILED, response)
+              return
+
+            print("Creating hello world in %s" % bucket)
+
+            s3 = boto3.client('s3')
+
+            try:
+              s3.put_object(
+                Bucket=bucket,
+                Body=b'<html><head><title>Hello</title></head><body><h1>Hello world!</h1></body></html>',
+                Key='index.html',
+                ContentType='text/html'
+              )
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'object created'}, 'index.html')
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': 'Cannot create index.html: %s' % str(e)})
+
+  # ------------------------------
+  # IAM role and Lambda function to check
+  # the ACM certificate request and update
+  # Route53 in order to automate the 
+  # request validation process. 
+  CertificateVerifierRole:
+    Condition: IsInUSEast1
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: AllowValidatingACMRequests
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Resource: '*'
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Sid: AllowCheckACM
+                Effect: Allow
+                Resource: '*'
+                Action:
+                  - acm:Describe*
+                  - acm:List*
+              - Sid: AllowupdateRoute53
+                Effect: Allow
+                Resource: '*'
+                Action:
+                  - route53:ChangeResourceRecordSets
+
+  # ------------------------------
+  # This is tricksy:
+  # We can't use !Ref from the ACM certificate, because
+  # that's not available until the cert is created;
+  # but we have to validate it in order to create it. 
+  # Enter ... shenanigans!
+  # We look for an ACM certificate for the domain requested above, and derive 
+  # the ARN from that
+  CertificateVerifierFunction:
+    Condition: IsInUSEast1
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt CertificateVerifierRole.Arn
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import boto3
+
+            def create_rr(domain, name, type, val):
+              r53 = boto3.client('route53')
+              zones = r53.list_hosted_zones_by_name(DNSName=domain)
+              zoneid = zones['HostedZones'][0]['Id']
+              r53.change_resource_record_sets(
+                HostedZoneId=zoneid,
+                ChangeBatch={
+                  'Changes': [
+                    {
+                      'Action': 'UPSERT',
+                      'ResourceRecordSet': {
+                        'Name': name,
+                        'TTL': 300,
+                        'Type': type,
+                        'ResourceRecords': [
+                          {
+                            'Value': val
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                }
+              )
+
+
+            def lambda_handler(event, context):
+              acm = boto3.client('acm')
+              res = acm.list_certificates()
+              if len(res['CertificateSummaryList']) == 0:
+                return
+
+              found = False
+              for cert in res['CertificateSummaryList']:
+                if cert['DomainName'] != "${SitePrefix}.${Domain}":
+                  continue
+
+                found = True
+                desc = acm.describe_certificate(CertificateArn=cert['CertificateArn'])
+                for opts in desc['Certificate']['DomainValidationOptions']:
+                  if opts['ValidationMethod'] == 'DNS':
+                    rr_name = opts['ResourceRecord']['Name']
+                    rr_type = opts['ResourceRecord']['Type']
+                    rr_val  = opts['ResourceRecord']['Value']
+
+                    create_rr('${Domain}', rr_name, rr_type, rr_val)
+
+  CertificateVerifierPermission:
+    Condition: IsInUSEast1
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CertificateVerifierFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+
+  # We use a CloudWatch scheduled event to trigger the Lambda function regularly
+  ValidateScheduler:
+    Condition: IsInUSEast1
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'cron(* * * * ? *)'
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt CertificateVerifierFunction.Arn
+          Id: ValidateLambda
+  
+  # ------------------------------
+  # IAM role and Lambda function to check
+  # username and password -- this is where the
+  # magic is
+  ViewerAuthRole:
+    Condition: IsInUSEast1
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+      Policies:
+        - PolicyName: DoTheNeedful
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Resource: '*'
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+  # have to retain on deletion, because Lambda@Edge functions cannot be deleted until
+  # all their replicas have been removed. This can take several hours.
+  ViewerAuthFunction:
+    DeletionPolicy: Retain 
+    Condition: IsInUSEast1
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs6.10 # has to be nodejs6.10 or nodejs8.10, but only 6.10 is supported for inline
+      Timeout: 5
+      MemorySize: 128
+      Role: !GetAtt ViewerAuthRole.Arn
+      Code:
+        ZipFile: 
+          Fn::Sub: |
+            'use strict';
+            exports.handler = (event, context, callback) => {
+
+              console.log('Got event ' + event);
+
+              // Get request and request headers
+              const request = event.Records[0].cf.request;
+              const headers = request.headers;
+
+              // Configure authentication
+              const authUser = '${Username}';
+              const authPass = '${Password}';
+
+              // Construct the Basic Auth string
+              const authString = 'Basic ' + new Buffer(authUser + ':' + authPass).toString('base64');
+
+              // Require Basic authentication
+              if (typeof headers.authorization == 'undefined' || headers.authorization[0].value != authString) {
+                const body = 'Unauthorized';
+                const response = {
+                  status: '401',
+                  statusDescription: 'Unauthorized',
+                  body: body,
+                  headers: {
+                    'www-authenticate': [{key: 'WWW-Authenticate', value:'Basic'}]
+                  },
+                };
+                callback(null, response);
+              }
+
+              // Continue request processing if authentication passed
+              callback(null, request);
+            };
+
+  ViewerAuthFunctionVersion2:
+    Condition: IsInUSEast1
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ViewerAuthFunction
+
+  DNSEntry:
+    Condition: IsInUSEast1
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # special for cloudfront
+      HostedZoneName: !Sub ${Domain}.
+      Name: !Sub ${SitePrefix}.${Domain}.
+      Type: A
+
+  Distribution:
+    DependsOn: LogsBucketPolicy
+    Condition: IsInUSEast1
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: Name
+          Value: S3-Singlepage-Distribution
+      DistributionConfig:
+        Aliases:
+          - !Sub ${SitePrefix}.${Domain}
+        DefaultCacheBehavior:
+          DefaultTTL: 300
+          ForwardedValues:
+            QueryString: false
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref ViewerAuthFunctionVersion2
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        Logging:
+            Bucket: !Ref LogsBucket
+        Origins:
+          - Id: s3-origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${AccessIdentity}
+            DomainName: !Sub ${ContentBucket}.s3.${AWS::Region}.amazonaws.com
+        ViewerCertificate:
+          AcmCertificateArn: !Ref ACMCertificate
+          SslSupportMethod: sni-only

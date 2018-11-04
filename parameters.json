@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "Username",
+    "ParameterValue": "visitor"
+  },
+  {
+    "ParameterKey": "Password",
+    "ParameterValue": "higgledy-piggledy"
+  },
+  {
+    "ParameterKey": "Domain",
+    "ParameterValue": "thanatopho.be"
+  },
+  {
+    "ParameterKey": "SitePrefix",
+    "ParameterValue": "www"
+  }
+]
