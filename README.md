@@ -1,6 +1,6 @@
 # S3-hosted site with password protection
 
-This template goes with the blog post on the Cevo website.
+This template goes with [the blog post on the Cevo website](https://cevo.com.au/post/2018-11-01-password-protected-s3-websites/).
 
 It creates a stack which provides a password-protected front end to a static S3-hosted website.
 Unlike hosting a site directly from S3, this has the advantage of:
