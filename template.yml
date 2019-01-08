@@ -182,6 +182,7 @@ Resources:
                 Resource: '*'
                 Action:
                   - route53:ChangeResourceRecordSets
+                  - route53:List*
 
   # ------------------------------
   # This is tricksy:
